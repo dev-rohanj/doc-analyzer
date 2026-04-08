@@ -1,54 +1,54 @@
 """
-legal document analysis using a 5-pass pipeline:
-
-  Pass 1 — Summary     : Summarise each chunk in plain English
-  Pass 2 — Entities    : Extract persons and organisations only
-  Pass 3 — Clauses     : Detect and explain key terms and provisions
-  Pass 4 — Risks       : Flag one-sided, hidden, or harmful terms
-  Pass 5 — Synthesis   : Merge, deduplicate, and score risk
-
-Splitting work across focused passes keeps each prompt small enough
-for an 8B model (gemma4) to handle accurately without losing context.
+Legal document analysis — 5-pass pipeline
+==========================================
+Pass 1 — Summary     : Summarise each chunk in plain English
+Pass 2 — Entities    : Extract persons and organisations only
+Pass 3 — Clauses     : Detect and explain key terms and provisions
+Pass 4 — Risks       : Flag one-sided, hidden, or harmful terms
+Pass 5 — Synthesis   : Merge, deduplicate, and score risk
 """
 
+import asyncio
 import json
+import math
 import os
+import re
 import time
 import httpx
-from ollama import Client
+from ollama import AsyncClient
 from dotenv import load_dotenv
 
 load_dotenv()
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4")
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi4-mini")
 
 
 def _log(tag: str, msg: str) -> None:
-    """Pretty-print a labelled log line to stdout."""
-    print(f"\n{'='*60}")
-    print(f"  {tag}")
-    print(f"{'='*60}")
-    print(msg)
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}\n  {tag}\n{'='*60}\n{msg}\n{'='*60}\n")
 
 
 # ---------------------------------------------------------------------------
-# Config — edit these directly to tune behaviour
+# Config
 # ---------------------------------------------------------------------------
+OLLAMA_TIMEOUT_SECONDS  = None
+MAX_ANALYSIS_CHARS      = 120_000
+CHUNK_SIZE_CHARS        = 4_000
+CHUNK_OVERLAP_CHARS     = 400
+MAX_CHUNKS              = 24
+MAX_SUMMARIES_IN_SYNTH  = 12
+MAX_CLAUSES_IN_SYNTH    = 24
+MAX_RISKS_IN_SYNTH      = 24
+MAX_CLAUSES_OUTPUT      = 16
+MAX_RISKS_OUTPUT        = 16
+MIN_CHUNK_WORDS         = 40
 
-OLLAMA_TIMEOUT_SECONDS = None     # None = no timeout; set e.g. 120.0 to add one
+# Minimum char length for a valid person/org name — rejects "Mr.", "A", etc.
+MIN_ENTITY_LEN     = 4
+# Reject strings with slashes, digits, or non-Latin garbage (OCR noise)
+_GARBAGE_ENTITY_RE = re.compile(r"[/\\0-9@#$%^&*<>{}|~`]|æ|ø|ð", re.IGNORECASE)
 
-MAX_ANALYSIS_CHARS  = 120_000     # truncate input beyond this
-CHUNK_SIZE_CHARS    = 4_000       # characters per chunk fed to the model
-CHUNK_OVERLAP_CHARS = 400         # overlap between consecutive chunks
-MAX_CHUNKS          = 24          # hard cap on number of chunks
-
-MAX_SUMMARIES_IN_SYNTH = 12       # how many chunk summaries to pass into synthesis
-MAX_CLAUSES_IN_SYNTH   = 24       # max raw clauses fed into synthesis
-MAX_RISKS_IN_SYNTH     = 24       # max raw risks fed into synthesis
-MAX_CLAUSES_OUTPUT     = 16       # max clauses in the final result
-MAX_RISKS_OUTPUT       = 16       # max risks in the final result
+VALID_SEVERITIES = {"high", "medium", "low"}
 
 REFERENCE_CLAUSE_TOPICS = [
     "payment and pricing",
@@ -73,38 +73,40 @@ REFERENCE_CLAUSE_TOPICS = [
     "penalties, liquidated damages, or cancellation fees",
 ]
 
+_TOPICS_BULLET = "\n".join(f"- {t}" for t in REFERENCE_CLAUSE_TOPICS)
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 def analyze_document(text: str) -> dict:
-    """
-    Run the 5-pass pipeline and return a structured analysis result.
-    """
+    return asyncio.run(_analyze_document_async(text))
+
+
+async def _analyze_document_async(text: str) -> dict:
     prepared = text[:MAX_ANALYSIS_CHARS]
     if not prepared.strip():
         return _empty_result()
 
     chunks = _chunk_text(prepared)
-    total  = len(chunks)
+    chunks = [c for c in chunks if len(c.split()) >= MIN_CHUNK_WORDS]
+    if not chunks:
+        return _empty_result()
+
+    total = len(chunks)
     _log("PIPELINE START", f"Document split into {total} chunk(s)  |  model: {OLLAMA_MODEL}")
 
-    # --- Pass 1: per-chunk summaries ------------------------------------
-    _log("PASS 1 — SUMMARY", f"Summarising {total} chunk(s)...")
-    summaries = []
-    for i, chunk in enumerate(chunks):
-        s = _pass_summary(chunk, i + 1, total)
-        preview = (s[:200] + "...") if len(s) > 200 else s
-        _log(f"PASS 1 — CHUNK {i+1}/{total}", preview or "(empty)")
-        summaries.append(s)
+    # --- Pass 1 ---
+    _log("PASS 1 — SUMMARY", f"Summarising {total} chunk(s) in parallel...")
+    summaries = await _parallel([_pass_summary(c, i + 1, total) for i, c in enumerate(chunks)])
+    for i, s in enumerate(summaries):
+        _log(f"PASS 1 — CHUNK {i+1}/{total}", (s[:200] + "...") if len(s) > 200 else s or "(empty)")
 
-    # --- Pass 2: per-chunk entity extraction ----------------------------
-    _log("PASS 2 — ENTITIES", f"Extracting entities from {total} chunk(s)...")
-    raw_persons = []
-    raw_orgs    = []
-    for i, chunk in enumerate(chunks):
-        ents = _pass_entities(chunk)
+    # --- Pass 2 ---
+    _log("PASS 2 — ENTITIES", f"Extracting entities from {total} chunk(s) in parallel...")
+    entity_results = await _parallel([_pass_entities(c) for c in chunks])
+    raw_persons, raw_orgs = [], []
+    for i, ents in enumerate(entity_results):
         _log(
             f"PASS 2 — CHUNK {i+1}/{total}",
             f"  persons: {ents.get('persons', [])}\n  orgs:    {ents.get('organizations', [])}",
@@ -112,15 +114,15 @@ def analyze_document(text: str) -> dict:
         raw_persons.extend(ents.get("persons", []))
         raw_orgs.extend(ents.get("organizations", []))
 
-    persons = _unique_strings(raw_persons, 40)
-    orgs    = _unique_strings(raw_orgs, 40)
+    persons = _fuzzy_unique(_clean_entities(raw_persons), 40)
+    orgs    = _fuzzy_unique(_clean_entities(raw_orgs),    40)
     _log("PASS 2 — MERGED", f"  persons: {persons}\n  orgs:    {orgs}")
 
-    # --- Pass 3: per-chunk clause detection ----------------------------
-    _log("PASS 3 — CLAUSES", f"Detecting clauses in {total} chunk(s)...")
+    # --- Pass 3 ---
+    _log("PASS 3 — CLAUSES", f"Detecting clauses in {total} chunk(s) in parallel...")
+    clause_results = await _parallel([_pass_clauses(c, i + 1, total) for i, c in enumerate(chunks)])
     raw_clauses: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        found = _pass_clauses(chunk, i + 1, total)
+    for i, found in enumerate(clause_results):
         _log(
             f"PASS 3 — CHUNK {i+1}/{total}",
             "\n".join(f"  [{c['name']}] {c['plain_language']}" for c in found) or "  (none found)",
@@ -133,11 +135,11 @@ def analyze_document(text: str) -> dict:
     )
     _log("PASS 3 — MERGED", f"  {len(clauses)} unique clause(s) collected")
 
-    # --- Pass 4: per-chunk risk detection ------------------------------
-    _log("PASS 4 — RISKS", f"Detecting risks in {total} chunk(s)...")
+    # --- Pass 4 ---
+    _log("PASS 4 — RISKS", f"Detecting risks in {total} chunk(s) in parallel...")
+    risk_results = await _parallel([_pass_risks(c, i + 1, total) for i, c in enumerate(chunks)])
     raw_risks: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        found = _pass_risks(chunk, i + 1, total)
+    for i, found in enumerate(risk_results):
         _log(
             f"PASS 4 — CHUNK {i+1}/{total}",
             "\n".join(
@@ -153,13 +155,8 @@ def analyze_document(text: str) -> dict:
     )
     _log("PASS 4 — MERGED", f"  {len(risks)} unique risk(s) collected")
 
-    # --- Pass 5: synthesis (summary only — clauses/risks assembled directly) ---
-    # The model cannot reliably merge 24 clauses + 18 risks in one call on 8B hardware.
-    # So synthesis only writes the final summary. Clauses and risks come straight
-    # from the per-chunk results, already deduplicated above.
+    # --- Pass 5 ---
     _log("PASS 5 — SYNTHESIS", "Writing final summary from chunk summaries...")
-
-    # Slim evidence: only summaries + entity lists (no clauses/risks — too large)
     slim_evidence = {
         "chunk_summaries": [
             {"chunk": i + 1, "summary": s}
@@ -169,16 +166,15 @@ def analyze_document(text: str) -> dict:
         "persons":       persons,
         "organizations": orgs,
     }
-    final_summary, final_persons, final_orgs = _pass_synthesis(slim_evidence)
+    final_summary, final_persons, final_orgs = await _pass_synthesis(slim_evidence)
 
-    # Assemble final result — clauses and risks come directly from per-chunk passes
     final = {
         "summary": final_summary,
         "entities": {
             "persons":       final_persons,
             "organizations": final_orgs,
         },
-        "clauses": _unique_items_by_key(clauses, "name", MAX_CLAUSES_OUTPUT),
+        "clauses": _unique_items_by_key(clauses, "name",  MAX_CLAUSES_OUTPUT),
         "risks":   _unique_items_by_key(risks,   "label", MAX_RISKS_OUTPUT),
     }
 
@@ -195,10 +191,6 @@ def analyze_document(text: str) -> dict:
 
 
 def analyze_pdf(uploaded_file) -> dict:
-    """
-    Ollama does not accept raw PDFs directly.
-    Extract text before calling analyze_document().
-    """
     raise RuntimeError(
         "No text could be extracted from this PDF. "
         "The Ollama pipeline only processes extracted text — "
@@ -207,15 +199,12 @@ def analyze_pdf(uploaded_file) -> dict:
 
 
 def calculate_risk_score(risks: list) -> dict:
-    """
-    Compute a 0-100 risk score from the detected risks list.
-    """
     if not risks:
         return {"score": 0, "category": "Low Risk", "color": "green"}
 
     weights = {"high": 15, "medium": 7, "low": 3}
-    raw    = sum(weights.get(r.get("severity", ""), 0) for r in risks)
-    score  = min(int((raw / 120) * 100), 100)
+    raw   = sum(weights.get(r.get("severity", ""), 0) for r in risks)
+    score = int(100 / (1 + math.exp(-0.04 * (raw - 60))))
 
     if score <= 30:
         return {"score": score, "category": "Low Risk",    "color": "green"}
@@ -226,283 +215,249 @@ def calculate_risk_score(risks: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Pass 1 — Summary
+# Async helpers
 # ---------------------------------------------------------------------------
+async def _parallel(coros: list) -> list:
+    return list(await asyncio.gather(*coros, return_exceptions=False))
 
-_SUMMARY_SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 
-def _pass_summary(chunk: str, index: int, total: int) -> str:
-    prompt = f"""
-You are a legal document analyst. Read the following contract excerpt and write a concise summary.
+# ---------------------------------------------------------------------------
+# Pass 1 — Summary
+# Giving phi4-mini a concrete output example anchors its JSON structure.
+# ---------------------------------------------------------------------------
+async def _pass_summary(chunk: str, index: int, total: int) -> str:
+    prompt = f"""You are a legal analyst reading part {index} of {total} of a contract.
 
-Rules:
-- Write 3 to 5 sentences only.
-- Use simple, plain English that a non-lawyer can understand.
-- Describe what this part of the document covers.
-- Do not give legal advice or recommendations.
-- Return only JSON matching this schema: {json.dumps(_SUMMARY_SCHEMA)}
-- Do not wrap JSON in markdown fences.
+Summarise the key points of this section in 3 to 5 plain English sentences.
+Focus on: who the parties are, what is being agreed, any important dates or amounts, and key obligations.
 
-Chunk {index} of {total}:
+Output ONLY this JSON and nothing else:
+{{"summary": "Your summary here."}}
+
+CONTRACT SECTION:
 \"\"\"
 {chunk}
 \"\"\"
-""".strip()
-    result = _run_ollama_json(prompt)
-    return (result.get("summary") or "").strip()
+"""
+    try:
+        result = await _run_ollama_json_async(prompt)
+        return (result.get("summary") or "").strip()
+    except Exception as e:
+        _log(f"PASS 1 — CHUNK {index} ERROR", str(e))
+        return ""
 
 
 # ---------------------------------------------------------------------------
 # Pass 2 — Entities
+# Explicit rejection rules are critical for phi4-mini on OCR-noisy PDFs.
 # ---------------------------------------------------------------------------
+async def _pass_entities(chunk: str) -> dict:
+    prompt = f"""You are extracting named persons and organisations from a legal contract.
 
-_ENTITIES_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "persons":       {"type": "array", "items": {"type": "string"}},
-        "organizations": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["persons", "organizations"],
-}
+RULES — READ CAREFULLY:
+1. Only extract names that are clearly and fully written in the text.
+2. A valid person name has at least a first name and last name (e.g. "Mahesh Patil").
+3. REJECT any string that contains: slashes, digits, symbols, garbled characters, or looks like OCR noise.
+4. REJECT role labels like "Owner", "Licensee", "Licensor", "Tenant", "Party".
+5. REJECT partial strings like "Mr.", "Owner Mr.", "Sign/Eætt".
+6. If you are not sure a name is real, leave it out.
+7. Return empty arrays if no valid names are found — do NOT guess.
 
-def _pass_entities(chunk: str) -> dict:
-    prompt = f"""
-You are a named entity extractor. Read the following contract excerpt.
+Output ONLY this JSON and nothing else:
+{{
+  "persons": ["Full Name 1", "Full Name 2"],
+  "organizations": ["Org Name 1"]
+}}
 
-Tasks:
-- Extract the full names of individual persons explicitly mentioned.
-- Extract the full names of companies, organisations, or legal entities explicitly mentioned.
-- Do not invent names that are not present in the text.
-
-Return only JSON matching this schema: {json.dumps(_ENTITIES_SCHEMA)}
-Do not wrap JSON in markdown fences.
-
-Contract excerpt:
+CONTRACT SECTION:
 \"\"\"
 {chunk}
 \"\"\"
-""".strip()
-    result = _run_ollama_json(prompt)
-    return {
-        "persons":       _unique_strings(result.get("persons", []), 25),
-        "organizations": _unique_strings(result.get("organizations", []), 25),
-    }
+"""
+    try:
+        result = await _run_ollama_json_async(prompt)
+        return {
+            "persons":       _fuzzy_unique(_clean_entities(result.get("persons", [])),       25),
+            "organizations": _fuzzy_unique(_clean_entities(result.get("organizations", [])), 25),
+        }
+    except Exception as e:
+        _log("PASS 2 — ERROR", str(e))
+        return {"persons": [], "organizations": []}
 
 
 # ---------------------------------------------------------------------------
 # Pass 3 — Clauses
+# Require verbatim excerpts and short names. Concrete example in prompt.
 # ---------------------------------------------------------------------------
+async def _pass_clauses(chunk: str, index: int, total: int) -> list[dict]:
+    prompt = f"""You are a legal analyst extracting contract clauses from section {index} of {total}.
 
-_CLAUSE_ITEM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "name":           {"type": "string"},
-        "excerpt":        {"type": "string"},
-        "plain_language": {"type": "string"},
-    },
-    "required": ["name", "excerpt", "plain_language"],
-}
-_CLAUSES_SCHEMA = {
-    "type": "object",
-    "properties": {"clauses": {"type": "array", "items": _CLAUSE_ITEM_SCHEMA}},
-    "required": ["clauses"],
-}
+For each important clause you find, return:
+- "name": a short label (3-6 words) matching one of these topics if possible:
+{_TOPICS_BULLET}
+- "excerpt": copy a SHORT verbatim quote (max 30 words) directly from the text. DO NOT invent or paraphrase.
+- "plain_language": one clear sentence explaining what this clause means for the tenant/licensee.
 
-def _pass_clauses(chunk: str, index: int, total: int) -> list[dict]:
-    topics_json = json.dumps(REFERENCE_CLAUSE_TOPICS)
-    prompt = f"""
-You are a legal clause extractor. Read the following contract excerpt and identify important clauses or terms.
+RULES:
+1. Only extract clauses that genuinely appear in the text below.
+2. The excerpt MUST be words copied directly from the text — never invented.
+3. If no relevant clauses exist in this section, return an empty list.
+4. Do NOT duplicate clauses with the same meaning.
+5. Maximum 5 clauses per section.
 
-Reference clause areas (not a fixed list — include other important terms too):
-{topics_json}
+Output ONLY this JSON and nothing else:
+{{
+  "clauses": [
+    {{
+      "name": "Termination and Exit Rights",
+      "excerpt": "The Licensor shall have an option to terminate this Agreement by giving one month prior notice.",
+      "plain_language": "Either party can end this agreement by giving one month written notice."
+    }}
+  ]
+}}
 
-For each clause found, provide:
-- name: a short clause name (under 60 characters)
-- excerpt: a short excerpt or close paraphrase under 280 characters
-- plain_language: a plain English explanation under 220 characters that a non-lawyer can understand
-
-Rules:
-- Only include clauses clearly supported by the text.
-- Do not guess or speculate.
-- If the excerpt contains no meaningful clauses, return an empty clauses array.
-- Return only JSON matching this schema: {json.dumps(_CLAUSES_SCHEMA)}
-- Do not wrap JSON in markdown fences.
-
-Chunk {index} of {total}:
+CONTRACT SECTION:
 \"\"\"
 {chunk}
 \"\"\"
-""".strip()
-    result = _run_ollama_json(prompt)
-    raw = result.get("clauses", [])
-    out = []
-    for item in raw:
-        name  = (item.get("name") or "").strip()
-        plain = (item.get("plain_language") or "").strip()
-        if not name or not plain:
-            continue
-        out.append({
-            "name":           name,
-            "excerpt":        (item.get("excerpt") or "").strip(),
-            "plain_language": plain,
-        })
-    return out
+"""
+    try:
+        result = await _run_ollama_json_async(prompt)
+        raw = result.get("clauses", [])
+        cleaned = []
+        for c in raw:
+            name  = (c.get("name")           or "").strip()
+            excpt = (c.get("excerpt")         or "").strip()
+            plain = (c.get("plain_language")  or "").strip()
+            if not name or not plain:
+                continue
+            # Reject excerpts that look invented (OCR-noise pattern: all-caps run + slash)
+            if excpt and re.search(r"\b[A-Z]{5,}\b", excpt) and "/" in excpt:
+                excpt = ""
+            cleaned.append({"name": name, "excerpt": excpt, "plain_language": plain})
+        return cleaned
+    except Exception as e:
+        _log(f"PASS 3 — CHUNK {index} ERROR", str(e))
+        return []
 
 
 # ---------------------------------------------------------------------------
 # Pass 4 — Risks
+# Hard-enforce severity enum. phi4-mini invents "medium-high", "medium-low".
 # ---------------------------------------------------------------------------
+async def _pass_risks(chunk: str, index: int, total: int) -> list[dict]:
+    prompt = f"""You are a legal risk analyst reviewing section {index} of {total} of a contract.
 
-_RISK_ITEM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "label":          {"type": "string"},
-        "severity":       {"type": "string", "enum": ["high", "medium", "low"]},
-        "found_keywords": {"type": "array", "items": {"type": "string"}},
-        "plain_language": {"type": "string"},
-    },
-    "required": ["label", "severity", "found_keywords", "plain_language"],
-}
-_RISKS_SCHEMA = {
-    "type": "object",
-    "properties": {"risks": {"type": "array", "items": _RISK_ITEM_SCHEMA}},
-    "required": ["risks"],
-}
+Identify terms that are unfair, one-sided, risky, hidden, or harmful to the tenant/licensee.
 
-def _pass_risks(chunk: str, index: int, total: int) -> list[dict]:
-    prompt = f"""
-You are a legal risk analyst. Read the following contract excerpt and identify notable legal or commercial risks.
+For each risk, return:
+- "label": a short name for the risk (4-7 words)
+- "severity": MUST be exactly one of: "high", "medium", or "low"
+  - high   = could cause significant financial loss or legal liability
+  - medium = creates ambiguity or moderate disadvantage
+  - low    = minor inconvenience or common standard clause
+- "found_keywords": 1-3 short phrases from the text that triggered this risk
+- "plain_language": one sentence explaining the risk in simple English
 
-Look for:
-- Broad or unlimited indemnity obligations
-- Unilateral rights to change terms or pricing
-- Auto-renewal or rollover traps
-- Hidden fees or pass-through costs
-- Harsh termination rights or exit penalties
-- Exclusivity or lock-in clauses
-- Non-compete overreach
-- One-sided liability limits
-- Missing obligations from one party
-- Vague or ambiguous language that could be exploited
-- Any term that is strongly unfair, unusual, or harmful
+RULES:
+1. Only flag risks grounded in the actual text — do NOT guess or assume.
+2. The severity field MUST be exactly "high", "medium", or "low". Never use "medium-high", "medium-low", or any other value.
+3. Do NOT flag normal standard clauses as risks (e.g. "tenant must not damage property").
+4. If there are no risks in this section, return an empty list.
+5. Maximum 6 risks per section.
 
-For each risk found:
-- label: a short professional label under 80 characters
-- severity: one of high, medium, or low
-- found_keywords: up to 3 short phrases from the text that triggered this risk
-- plain_language: a plain English explanation under 220 characters
+Output ONLY this JSON and nothing else:
+{{
+  "risks": [
+    {{
+      "label": "Unilateral rent increase clause",
+      "severity": "high",
+      "found_keywords": ["10% rent increase", "at time of renewal"],
+      "plain_language": "The landlord can raise rent by 10% at each renewal with no negotiation rights for the tenant."
+    }}
+  ]
+}}
 
-Severity guide:
-- high: materially adverse, punitive, or clearly harmful to one party
-- medium: potentially problematic, worth careful review
-- low: minor imbalance or noteworthy term
-
-Rules:
-- Only flag risks clearly supported by the text.
-- Do not speculate or invent risks not present.
-- If no meaningful risks exist, return an empty risks array.
-- Return only JSON matching this schema: {json.dumps(_RISKS_SCHEMA)}
-- Do not wrap JSON in markdown fences.
-
-Chunk {index} of {total}:
+CONTRACT SECTION:
 \"\"\"
 {chunk}
 \"\"\"
-""".strip()
-    result = _run_ollama_json(prompt)
-    raw = result.get("risks", [])
-    out = []
-    for risk in raw:
-        severity = (risk.get("severity") or "").lower()
-        if severity not in {"high", "medium", "low"}:
-            continue
-        label = (risk.get("label") or "").strip()
-        plain = (risk.get("plain_language") or "").strip()
-        if not label or not plain:
-            continue
-        out.append({
-            "label":          label,
-            "severity":       severity,
-            "found_keywords": _unique_strings(risk.get("found_keywords", []), 3),
-            "plain_language": plain,
-        })
-    return out
+"""
+    try:
+        result = await _run_ollama_json_async(prompt)
+        raw = result.get("risks", [])
+        cleaned = []
+        for r in raw:
+            label = (r.get("label")          or "").strip()
+            plain = (r.get("plain_language")  or "").strip()
+            if not label or not plain:
+                continue
+            sev = _normalise_severity((r.get("severity") or "").lower().strip())
+            cleaned.append({
+                "label":          label,
+                "severity":       sev,
+                "found_keywords": _fuzzy_unique(r.get("found_keywords", []), 3),
+                "plain_language": plain,
+            })
+        return cleaned
+    except Exception as e:
+        _log(f"PASS 4 — CHUNK {index} ERROR", str(e))
+        return []
 
 
 # ---------------------------------------------------------------------------
 # Pass 5 — Synthesis
+# Keep prompt short — phi4-mini quality degrades with very long prompts.
+# Use bullet list instead of raw JSON evidence.
 # ---------------------------------------------------------------------------
+async def _pass_synthesis(evidence: dict) -> tuple[str, list, list]:
+    bullets = "\n".join(
+        f"- {item['summary']}"
+        for item in evidence.get("chunk_summaries", [])
+        if item.get("summary")
+    )
+    persons_hint = ", ".join(evidence.get("persons", [])) or "none found"
+    orgs_hint    = ", ".join(evidence.get("organizations", [])) or "none found"
 
-# Synthesis schema is now minimal — summary + entities only.
-# Clauses and risks are assembled directly from per-chunk results.
-_SYNTHESIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "persons":       {"type": "array", "items": {"type": "string"}},
-        "organizations": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["summary", "persons", "organizations"],
-}
+    prompt = f"""You are a legal analyst. Write a final summary of a contract based on these section summaries:
 
-def _pass_synthesis(evidence: dict) -> tuple[str, list, list]:
-    """
-    Only task: write a final summary and clean up entity lists.
-    Returns (summary, persons, organizations).
-    Clauses and risks are handled directly in analyze_document.
-    """
-    schema_json   = json.dumps(_SYNTHESIS_SCHEMA, indent=2)
-    evidence_json = json.dumps(evidence, indent=2)
-    prompt = f"""
-You are a legal document analyst. You have been given summaries of each section
-of a legal document, along with lists of persons and organisations mentioned.
+{bullets}
 
-Evidence:
-{evidence_json}
+Known parties — persons: {persons_hint} | organisations: {orgs_hint}
 
-Tasks:
-1. Write a final summary in 5 to 8 sentences covering the whole document.
-   - Use simple, plain English for a non-lawyer audience.
-   - Describe what the document is, who the parties are, and what the key terms cover.
-   - Do not give legal advice.
-2. Return a clean, deduplicated list of persons mentioned.
-   - Remove garbled text, OCR artifacts, and generic labels like "The owner".
-   - Keep only real, legible names.
-3. Return a clean, deduplicated list of organisations mentioned.
-   - Remove garbled text, OCR artifacts, and generic labels like "Police".
-   - Keep only real, legible organisation names.
+Write a clear 5-8 sentence summary in plain English covering:
+what the contract is for, who the parties are, key financial terms, duration, and termination rights.
+Also return cleaned lists of persons and organisations (real full names only, no role labels).
 
-Return only JSON matching this schema exactly:
-{schema_json}
-Do not wrap JSON in markdown fences.
-Do not add any text before or after the JSON object.
-""".strip()
+Output ONLY this JSON and nothing else:
+{{
+  "summary": "...",
+  "persons": ["Full Name"],
+  "organizations": ["Org Name"]
+}}
+"""
+    try:
+        payload = await _run_ollama_json_async(prompt)
+    except Exception as e:
+        _log("PASS 5 — ERROR", str(e))
+        payload = {}
 
-    payload = _run_ollama_json(prompt)
-
-    # Validate — if summary is missing or too short, fall back gracefully
     summary = (payload.get("summary") or "").strip()
     if len(summary) < 30:
-        _log("PASS 5 — WARNING", f"Synthesis returned a weak summary: '{summary}'. Using chunk summaries as fallback.")
-        summary = " ".join(v for v in evidence.get("chunk_summaries", [{}]) if isinstance(v, str))
-        if not summary:
-            summary = " ".join(
-                item.get("summary", "") for item in evidence.get("chunk_summaries", [])
-            )
+        _log("PASS 5 — WARNING", "Weak synthesis — falling back to concatenated chunk summaries.")
+        summary = " ".join(
+            item.get("summary", "") for item in evidence.get("chunk_summaries", [])
+        ).strip()
 
-    persons = _unique_strings(payload.get("persons", []), 25)
-    orgs    = _unique_strings(payload.get("organizations", []), 25)
+    persons = _fuzzy_unique(_clean_entities(payload.get("persons", [])), 25)
+    orgs    = _fuzzy_unique(_clean_entities(payload.get("organizations", [])), 25)
 
-    # If model returned nothing for entities, fall back to raw input
     if not persons:
-        persons = _unique_strings(evidence.get("persons", []), 25)
+        persons = _fuzzy_unique(_clean_entities(evidence.get("persons", [])), 25)
     if not orgs:
-        orgs = _unique_strings(evidence.get("organizations", []), 25)
+        orgs = _fuzzy_unique(_clean_entities(evidence.get("organizations", [])), 25)
 
     return summary, persons, orgs
-
-
-# _normalize_final removed — synthesis now returns (summary, persons, orgs) tuple directly.
 
 
 def _empty_result() -> dict:
@@ -515,74 +470,155 @@ def _empty_result() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Ollama client
+# Ollama async client
+# num_ctx MUST be >= chunk size in tokens.
+# 4000 chars ≈ 700-900 tokens. With prompt overhead, 4096 gives solid headroom.
+# 2048 was silently truncating every chunk — the #1 cause of hallucinated output.
 # ---------------------------------------------------------------------------
-
-def _run_ollama_json(prompt: str) -> dict:
-    client = Client(
+async def _run_ollama_json_async(prompt: str) -> dict:
+    client = AsyncClient(
         host=OLLAMA_HOST.rstrip("/"),
         timeout=OLLAMA_TIMEOUT_SECONDS,
     )
     try:
         t0 = time.time()
-        response = client.chat(
+        response = await client.chat(
             model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a JSON-only output engine. "
+                        "Your entire response must be valid JSON. "
+                        "Do not write any text outside the JSON object. "
+                        "Do not explain your reasoning. "
+                        "Do not add markdown formatting or code fences."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
             stream=False,
             format="json",
-            options={"temperature": 0.1},
+            options={
+                "temperature":    0.05,  # Low — reduces hallucination on structured tasks
+                "num_ctx":        4096,  # Was 2048 — must cover chunk + prompt overhead
+                "repeat_penalty": 1.1,   # Relaxed from 1.2 — was causing truncated JSON
+                "top_p":          0.9,   # Nucleus sampling — better for structured output
+            },
         )
         elapsed = time.time() - t0
     except httpx.TimeoutException as exc:
-        raise RuntimeError(
-            "Ollama request timed out. Increase OLLAMA_TIMEOUT_SECONDS "
-            "or set it to 0 to disable the client-side timeout."
-        ) from exc
+        raise RuntimeError("Ollama request timed out.") from exc
 
     message  = response.get("message") or {}
     raw_text = (message.get("content") or "").strip()
-    _log(f"LLM RAW RESPONSE  ({elapsed:.1f}s)", raw_text or "(empty)")
+
+    # Strip chain-of-thought blocks before parse
+    raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+
+    _log(f"LLM RAW RESPONSE ({elapsed:.1f}s)", raw_text or "(empty)")
+
     if not raw_text:
-        raise RuntimeError("Ollama returned an empty response.")
+        raise RuntimeError("Empty response from Ollama.")
 
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        return json.loads(_extract_json_object(raw_text))
+    return _parse_json_response(raw_text)
 
 
-def _extract_json_object(text: str) -> str:
-    start = text.find("{")
-    end   = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise RuntimeError("Ollama response was not valid JSON.")
-    return text[start: end + 1]
+def _parse_json_response(raw_text: str) -> dict:
+    fenced = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+
+    for candidate in (fenced, raw_text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    for open_ch, close_ch in (('{', '}'), ('[', ']')):
+        start = raw_text.find(open_ch)
+        end   = raw_text.rfind(close_ch)
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw_text[start: end + 1])
+            except json.JSONDecodeError:
+                pass
+
+    raise RuntimeError(f"Ollama response was not valid JSON: {raw_text[:200]}")
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+def _normalise_severity(sev: str) -> str:
+    """Map any severity variant to exactly high/medium/low."""
+    if sev in VALID_SEVERITIES:
+        return sev
+    if "high" in sev:
+        return "high"
+    if "low" in sev:
+        return "low"
+    return "medium"
+
+
+def _clean_entities(values: list) -> list:
+    """
+    Remove OCR noise, role labels, and garbage strings from entity lists.
+    Keeps only strings that look like plausible human/org names.
+    """
+    role_labels = {
+        "owner", "licensee", "licensor", "tenant", "landlord",
+        "party", "parties", "buyer", "seller", "agent", "broker",
+        "depositor", "mortgagor", "purchaser", "signatory",
+    }
+    cleaned = []
+    for val in values:
+        item = str(val).strip()
+        if len(item) < MIN_ENTITY_LEN:
+            continue
+        if _GARBAGE_ENTITY_RE.search(item):
+            continue
+        if item.lower() in role_labels:
+            continue
+        # Partial honorifics alone ("Mr.", "Mrs.")
+        if re.match(r"^(Mr\.|Mrs\.|Ms\.|Dr\.)\s*$", item, re.IGNORECASE):
+            continue
+        # Short all-caps are abbreviations, not names
+        if item.isupper() and len(item) <= 5:
+            continue
+        cleaned.append(item)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------------
-
 def _chunk_text(text: str) -> list[str]:
-    normalized = " ".join(text.split())
+    normalized = re.sub(r"[ \t]+", " ", text).strip()
     if not normalized:
         return [""]
 
-    chunks = []
+    sentence_ends = [0] + [
+        m.end() for m in re.finditer(r"[.!?]\s+(?=[A-Z\u00C0-\u017E])", normalized)
+    ]
+
+    chunks: list[str] = []
     start  = 0
     length = len(normalized)
 
     while start < length and len(chunks) < MAX_CHUNKS:
         end = min(start + CHUNK_SIZE_CHARS, length)
         if end < length:
-            split_at = normalized.rfind(" ", start, end)
-            if split_at > start + (CHUNK_SIZE_CHARS // 2):
-                end = split_at
+            lookback_from = start + int(CHUNK_SIZE_CHARS * 0.75)
+            sent_candidates = [p for p in sentence_ends if lookback_from <= p <= end]
+            if sent_candidates:
+                end = sent_candidates[-1]
+            else:
+                split_at = normalized.rfind(" ", start, end)
+                if split_at > start + (CHUNK_SIZE_CHARS // 2):
+                    end = split_at
 
         chunk = normalized[start:end].strip()
         if chunk:
             chunks.append(chunk)
-
         if end >= length:
             break
 
@@ -594,9 +630,40 @@ def _chunk_text(text: str) -> list[str]:
     return chunks or [normalized[:CHUNK_SIZE_CHARS]]
 
 
+def _levenshtein_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return 0.0
+    if max(la, lb) / max(min(la, lb), 1) > 2.5:
+        return 0.0
+    common_prefix = sum(1 for x, y in zip(a, b) if x == y)
+    return common_prefix / max(la, lb)
+
+
+def _fuzzy_unique(values: list, limit: int, threshold: float = 0.85) -> list:
+    seen:    list[str] = []
+    cleaned: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            continue
+        key = item.casefold()
+        if key in [s.casefold() for s in seen]:
+            continue
+        if any(_levenshtein_ratio(key, s.casefold()) >= threshold for s in seen):
+            continue
+        seen.append(item)
+        cleaned.append(item)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
 def _unique_strings(values: list, limit: int) -> list:
-    seen    = set()
-    cleaned = []
+    seen:    set[str]  = set()
+    cleaned: list[str] = []
     for value in values:
         item = str(value).strip()
         if not item:
@@ -612,8 +679,8 @@ def _unique_strings(values: list, limit: int) -> list:
 
 
 def _unique_items_by_key(items: list, key_name: str, limit: int) -> list:
-    seen    = set()
-    cleaned = []
+    seen:    set[str]   = set()
+    cleaned: list[dict] = []
     for item in items:
         key = item[key_name].casefold()
         if key in seen:

@@ -2,7 +2,13 @@
 
 Streamlit app for analyzing legal PDFs with a local Ollama model.
 
-It extracts text from the uploaded PDF and sends that text to Ollama for:
+It extracts text from the uploaded PDF and analyzes it in a small-prompt pipeline:
+- split document text into overlapping chunks
+- run chunk-level extraction for summary, entities, clauses, and risks
+- merge and deduplicate the chunk evidence
+- run a final synthesis pass for the document-level result
+
+The final output still includes:
 - document summary
 - clause detection
 - risk detection
@@ -40,8 +46,12 @@ Optional `.env` settings:
 
 ```env
 OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=qwen3.5:9b
+OLLAMA_MODEL=gemma4
 OLLAMA_TIMEOUT_SECONDS=0
+MAX_ANALYSIS_CHARS=120000
+OLLAMA_CHUNK_SIZE_CHARS=6000
+OLLAMA_CHUNK_OVERLAP_CHARS=500
+OLLAMA_MAX_CHUNKS=24
 ```
 
 ## Run
@@ -53,6 +63,8 @@ streamlit run app.py
 ## Notes
 
 - The default Ollama endpoint is `http://localhost:11434`.
-- The default model is `qwen3.5:9b`.
+- The default model is `gemma4`.
 - `OLLAMA_TIMEOUT_SECONDS=0` disables the client-side timeout; set a positive number of seconds if you want a limit.
+- The analyzer now uses a chunked pipeline so smaller local models do not need to handle the full document and all tasks in one prompt.
+- Reduce `OLLAMA_CHUNK_SIZE_CHARS` if your local model still struggles with context or latency.
 - Scanned or image-only PDFs will need OCR before analysis in the current implementation.
