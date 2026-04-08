@@ -326,11 +326,11 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 st.markdown("""
 <div class="hero-header">
-    <div class="hero-badge">⚖️ AI-Powered · Gemini Analysis</div>
+    <div class="hero-badge">⚖️ Local AI-Powered </div>
     <div class="hero-title">Legal Document Analyzer</div>
     <div class="hero-subtitle">
         Instantly extract clauses, detect risks, and understand any legal contract —
-        powered by Google Gemini with structured legal analysis.
+        powered by Local AI with structured legal analysis.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -349,12 +349,6 @@ uploaded_file = st.file_uploader(
     label_visibility="visible",
 )
 
-if not uploaded_file:
-    st.markdown(
-        '<div class="upload-hint">Supports PDF files · Requires a valid Gemini API key in .env</div>',
-        unsafe_allow_html=True,
-    )
-
 st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -371,7 +365,7 @@ if uploaded_file:
         uploaded_file.seek(0)
         pages = get_page_count(uploaded_file)
 
-        # ── 2. Run Gemini on extracted text when available; fall back to PDF ──
+        # ── 2. Run AI on extracted text when available; fall back to PDF ──
         try:
             if text.strip():
                 analysis = analyze_document(text)
@@ -379,7 +373,7 @@ if uploaded_file:
                 uploaded_file.seek(0)
                 analysis = analyze_pdf(uploaded_file)
         except Exception as exc:
-            st.error(f"⚠️ Gemini analysis failed: {exc}")
+            st.error(f"⚠️ AI analysis failed: {exc}")
             st.stop()
 
         summary     = analysis["summary"]
