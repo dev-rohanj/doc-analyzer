@@ -1,7 +1,7 @@
 """
 analyzer.py
 -----------
-Gemini-powered legal document analysis:
+Ollama-powered legal document analysis:
   - Document summary
   - Clause detection
   - Risk detection
@@ -10,18 +10,33 @@ Gemini-powered legal document analysis:
 """
 
 import json
-import io
 import os
-
+import httpx
+from ollama import Client
 from dotenv import load_dotenv
-from google import genai
-
 
 
 load_dotenv()
 
-GEMINI_MODEL = "gemini-2.5-flash"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b")
 MAX_ANALYSIS_CHARS = 120000
+
+
+def _parse_ollama_timeout(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+
+    timeout = float(value)
+    if timeout <= 0:
+        return None
+
+    return timeout
+
+
+OLLAMA_TIMEOUT_SECONDS = _parse_ollama_timeout(
+    os.getenv("OLLAMA_TIMEOUT_SECONDS", "0")
+)
 
 REFERENCE_CLAUSE_TOPICS = [
     "payment and pricing",
@@ -99,72 +114,25 @@ ANALYSIS_SCHEMA = {
 
 def analyze_document(text: str) -> dict:
     """
-    Analyze a legal document with Gemini and return a structured result.
+    Analyze a legal document with Ollama and return a structured result.
     """
-    client = _build_client()
     prepared_text = text[:MAX_ANALYSIS_CHARS]
-
     prompt = _build_analysis_prompt(
         source_label="document text",
         source_payload=f'Document:\n"""\n{prepared_text}\n"""',
     )
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": ANALYSIS_SCHEMA,
-            "temperature": 0.2,
-        },
-    )
-
-    payload = json.loads(response.text)
+    payload = _run_ollama_json(prompt)
     return _normalize_analysis(payload)
 
 
 def analyze_pdf(uploaded_file) -> dict:
     """
-    Analyze an uploaded PDF directly with Gemini Files API.
-    This allows Gemini to inspect scanned/image-based pages.
+    Ollama does not support passing raw PDFs here.
+    Keep the interface for the app and fail with a clear message.
     """
-    client = _build_client()
-
-    pdf_bytes = uploaded_file.getvalue()
-    if not pdf_bytes:
-        raise RuntimeError("Uploaded PDF is empty.")
-
-    pdf_buffer = io.BytesIO(pdf_bytes)
-    pdf_buffer.name = getattr(uploaded_file, "name", "document.pdf")
-
-    prompt = _build_analysis_prompt(
-        source_label="PDF",
-        source_payload="The PDF is attached as a file input.",
+    raise RuntimeError(
+        "No text could be extracted from this PDF. The current Ollama path only analyzes extracted text, so scanned or image-only PDFs need OCR before analysis."
     )
-
-    gemini_file = client.files.upload(
-        file=pdf_buffer,
-        config={"mime_type": "application/pdf"},
-    )
-
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[gemini_file, prompt],
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": ANALYSIS_SCHEMA,
-                "temperature": 0.2,
-            },
-        )
-    finally:
-        try:
-            client.files.delete(name=gemini_file.name)
-        except Exception:
-            pass
-
-    payload = json.loads(response.text)
-    return _normalize_analysis(payload)
 
 
 def calculate_risk_score(risks: list) -> dict:
@@ -191,9 +159,54 @@ def calculate_risk_score(risks: list) -> dict:
     return {"score": score, "category": category, "color": color}
 
 
+def _run_ollama_json(prompt: str) -> dict:
+    client = Client(
+        host=OLLAMA_HOST.rstrip("/"),
+        timeout=OLLAMA_TIMEOUT_SECONDS,
+    )
+    try:
+        response = client.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            stream=False,
+            format="json",
+            options={
+                "temperature": 0.2,
+            },
+        )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            "Ollama request timed out. Increase OLLAMA_TIMEOUT_SECONDS or set it to 0 to disable the client-side timeout."
+        ) from exc
+
+    message = response.get("message") or {}
+    raw_text = (message.get("content") or "").strip()
+    print(raw_text)
+    if not raw_text:
+        raise RuntimeError("Ollama returned an empty response.")
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return json.loads(_extract_json_object(raw_text))
+
+
+def _extract_json_object(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError("Ollama response was not valid JSON.")
+    return text[start : end + 1]
+
+
 def _normalize_analysis(payload: dict) -> dict:
     """
-    Normalize Gemini output into the shapes expected by the Streamlit app.
+    Normalize Ollama output into the shapes expected by the Streamlit app.
     """
     clauses = []
     for item in payload.get("clauses", []):
@@ -271,18 +284,13 @@ def _unique_items_by_key(items: list, key_name: str, limit: int) -> list:
     return cleaned
 
 
-def _build_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Missing Gemini API key. Add GEMINI_API_KEY to your .env file."
-        )
-    return genai.Client(api_key=api_key)
-
-
 def _build_analysis_prompt(source_label: str, source_payload: str) -> str:
+    schema_json = json.dumps(ANALYSIS_SCHEMA, indent=2)
     return f"""
-You are a professional legal document analysis engine. Review the provided {source_label} and return only valid JSON that matches the schema.
+You are a professional legal document analysis engine. Review the provided {source_label} and return only one valid JSON object.
+
+Return JSON that matches this schema exactly:
+{schema_json}
 
 Primary objective:
 - Produce a precise, formal, business-appropriate analysis suitable for a professional document review workflow.
@@ -301,7 +309,7 @@ Tasks:
      - a short excerpt or tightly grounded paraphrase
      - a plain_language explanation in simple non-lawyer English that explains what it means in practice
 4. Identify notable legal or commercial risks, including suspicious, one-sided, unfair, overbroad, hidden, unusual, or potentially harmful terms even if they do not match a standard clause category.
-   - Look for "shady" patterns such as broad indemnity, unilateral rights, hidden fees, vague obligations, auto-renewal traps, harsh termination rights, non-compete overreach, waiver of rights, unlimited liability, missing obligations from the other side, or terms that strongly favor one party.
+   - Look for shady patterns such as broad indemnity, unilateral rights, hidden fees, vague obligations, auto-renewal traps, harsh termination rights, non-compete overreach, waiver of rights, unlimited liability, missing obligations from the other side, or terms that strongly favor one party.
    - Also look for lock-in language such as forced renewal, same-broker dependency, exclusivity, trailing commissions, rollover terms, one-sided price changes, penalties for switching, and hidden payment obligations.
    - Each risk must include a short professional label, a severity of high, medium, or low, supporting keywords or phrases, and a plain_language explanation in simple non-lawyer English.
    - Treat a risky clause, an unusual omission, or a strongly imbalanced term as a valid risk if the document supports it.
@@ -337,6 +345,11 @@ Quality bar:
 - Treat severity conservatively: use high only for materially adverse, strongly one-sided, punitive, or clearly harmful terms.
 - For risk detection, do not limit yourself to the named clauses list.
 - Surface materially imbalanced terms even when they appear subtle, indirect, or scattered across multiple sections.
+
+Output rules:
+- Return only JSON.
+- Do not wrap JSON in markdown fences.
+- Do not add any text before or after the JSON object.
 
 {source_payload}
 """.strip()

@@ -1,15 +1,15 @@
 # AI Legal Document Analyzer
 
-Streamlit app for analyzing legal PDFs with Google Gemini.
+Streamlit app for analyzing legal PDFs with a local Ollama model.
 
-It sends the uploaded PDF directly to Gemini for:
+It extracts text from the uploaded PDF and sends that text to Ollama for:
 - document summary
 - clause detection
 - risk detection
 - people and organization extraction
 - overall risk scoring
 
-Local `pdfplumber` extraction is only used for optional stats like page count and word count when text is available.
+If no text can be extracted, the app currently stops with a clear error because this Ollama path does not handle raw scanned PDFs directly.
 
 ## Files
 
@@ -29,10 +29,19 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root:
+Install and run Ollama separately, then make sure your model is pulled:
+
+```bash
+ollama pull llama3.1:8b
+ollama serve
+```
+
+Optional `.env` settings:
 
 ```env
-GEMINI_API_KEY=your_api_key_here
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=qwen3.5:9b
+OLLAMA_TIMEOUT_SECONDS=0
 ```
 
 ## Run
@@ -43,6 +52,7 @@ streamlit run app.py
 
 ## Notes
 
-- Scanned or image-based PDFs are supported through Gemini PDF analysis.
-- Local word count may be low or zero when the PDF has no embedded text, but Gemini can still analyze the document itself.
-- The analyzer uses `gemini-2.5-flash` with structured JSON output.
+- The default Ollama endpoint is `http://localhost:11434`.
+- The default model is `qwen3.5:9b`.
+- `OLLAMA_TIMEOUT_SECONDS=0` disables the client-side timeout; set a positive number of seconds if you want a limit.
+- Scanned or image-only PDFs will need OCR before analysis in the current implementation.
