@@ -21,6 +21,8 @@ from google import genai
 load_dotenv()
 
 GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_MODEL = "gemini-2.5-flash-lite"
+
 MAX_ANALYSIS_CHARS = 120000
 
 REFERENCE_CLAUSE_TOPICS = [
