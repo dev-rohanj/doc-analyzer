@@ -1,6 +1,5 @@
 """
 Legal document analysis — 5-pass pipeline + Progressive Context Accumulator
-============================================================================
 
 Architecture
 ------------
@@ -24,14 +23,6 @@ Pass 4 — Risks       : Sequential across chunks. State tracks seen risk labels
 Pass 5 — Synthesis   : Single call. Receives confirmed state facts alongside
                        chunk summaries, so it doesn't have to guess doc type or
                        party names from garbled OCR hints.
-
-Token budget per prompt
------------------------
-State prefix:  ~200–350 tokens (well within phi4-mini budget)
-Chunk text:    ~700–900 tokens
-Prompt shell:  ~200–300 tokens
-Output cap:    set per-pass via num_predict
-Total input:   ~1100–1550 tokens — leaves healthy headroom inside 4096 ctx
 """
 
 import asyncio
@@ -99,18 +90,6 @@ REFERENCE_CLAUSE_TOPICS = [
 
 
 # ─── Progressive Context Accumulator ─────────────────────────────────────────
-#
-# Shared state object that travels through the entire pipeline.
-# Populated by Pass 0 (fingerprint) before any other pass runs.
-# Passes 3 and 4 also write to it as they process each chunk sequentially,
-# so each subsequent chunk knows what has already been found.
-#
-# Design constraints:
-#   - All fields serialise to short strings or small lists — never raw chunks
-#   - seen_clauses / seen_risks are sets of casefolded keys for O(1) lookup
-#   - build_prefix() renders state into a compact block (~200–350 tokens)
-#     that can be prepended to any pass prompt without overloading phi4-mini
-#
 
 @dataclass
 class PipelineState:
@@ -351,13 +330,7 @@ async def _parallel(coros: list) -> list:
 
 
 # ─── Pass 0 — Fingerprint ─────────────────────────────────────────────────────
-#
-# Runs on chunk 1 only (~1 LLM call overhead).
-# Extracts four facts that anchor every subsequent prompt:
-#   doc type, named parties, key dates, financial amounts.
-# Keeping the output schema flat and small ensures reliable extraction
-# without overrunning the generation budget.
-#
+
 async def _pass_fingerprint(chunk: str) -> dict:
     prompt = f"""You are reading the opening section of a legal document.
 
@@ -407,13 +380,7 @@ SECTION TEXT:
 
 
 # ─── Pass 1 — Summary ─────────────────────────────────────────────────────────
-#
-# State prefix (include_seen=False) provides doc type and party names so the
-# model uses consistent plain-English labels rather than copying raw role
-# labels ("Licensor", "Executant") from each chunk.
-# List-response guard prevents the crash seen when phi4-mini returns a JSON
-# array instead of a string for the summary field.
-#
+
 async def _pass_summary(chunk: str, index: int, total: int, state: PipelineState) -> str:
     prefix = state.build_prefix(include_seen=False)
     prompt = f"""{prefix}You are a legal document analyst. Read the excerpt below — it is section {index} of {total} from a legal agreement.
@@ -450,12 +417,7 @@ SECTION TEXT:
 
 
 # ─── Pass 2 — Entities ────────────────────────────────────────────────────────
-#
-# State prefix (include_seen=False) lists names confirmed from chunk 1.
-# Later chunks can corroborate the spelling rather than independently
-# re-extracting OCR variants of the same name.
-# Three-condition test forces the model to reason through each candidate.
-#
+
 async def _pass_entities(chunk: str, state: PipelineState) -> dict:
     prefix = state.build_prefix(include_seen=False)
     prompt = f"""{prefix}You are extracting the names of real people and real organisations from a section of a legal document.
@@ -505,14 +467,7 @@ SECTION TEXT:
 
 
 # ─── Pass 3 — Clauses ─────────────────────────────────────────────────────────
-#
-# Sequential execution means state.seen_clauses grows chunk by chunk.
-# The prefix tells the model exactly which clause types have already been
-# reported — it skips them entirely rather than generating duplicates that
-# need post-hoc dedup. This is the primary fix for the 2-clause-repeated-4x
-# problem observed in the original pipeline logs.
-# Rule 7 reinforces the "already found" prefix instruction at the rules level.
-#
+
 async def _pass_clauses(chunk: str, index: int, total: int, state: PipelineState) -> list[dict]:
     topics_numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(REFERENCE_CLAUSE_TOPICS))
     prefix = state.build_prefix(include_seen=True)
@@ -582,14 +537,7 @@ SECTION TEXT:
 
 
 # ─── Pass 4 — Risks ───────────────────────────────────────────────────────────
-#
-# Sequential execution means state.seen_risks grows chunk by chunk.
-# "Weaker party" framing generalises beyond rental docs to employment,
-# SaaS, loans, NDAs, and service contracts.
-# found_keywords verbatim requirement eliminates the bracket-notation
-# hallucination pattern seen in original logs: "(vague)", "(unlimited)".
-# Rule 7 reinforces the "already found" prefix instruction at the rules level.
-#
+
 async def _pass_risks(chunk: str, index: int, total: int, state: PipelineState) -> list[dict]:
     prefix = state.build_prefix(include_seen=True)
 
@@ -675,14 +623,7 @@ SECTION TEXT:
 
 
 # ─── Pass 5 — Synthesis ───────────────────────────────────────────────────────
-#
-# State provides confirmed doc_type, parties, key_dates, and financials from
-# the fingerprint pass — synthesis uses these directly rather than re-deriving
-# from potentially garbled chunk summaries.
-# "Candidate party names" framing signals the merge hints are unverified.
-# Discrepancy rule prevents silent figure selection when sections conflict.
-# List-response guard mirrors the Pass 1 fix.
-#
+
 async def _pass_synthesis(evidence: dict, state: PipelineState) -> tuple[str, list, list]:
     numbered = "\n".join(
         f"[Section {item['chunk']}]: {item['summary']}"
@@ -793,23 +734,8 @@ def _empty_result() -> dict:
 
 
 # ─── Ollama async client ──────────────────────────────────────────────────────
-#
-# num_ctx MUST be >= chunk size in tokens.
-# 4000 chars ≈ 700–900 tokens. State prefix adds ~200–350 tokens.
-# 4096 ctx gives solid headroom for chunk + prefix + prompt shell + output.
-# 2048 was silently truncating — the #1 original cause of hallucinated output.
-#
+
 async def _run_ollama_json_async(prompt: str, num_predict: int = 1024) -> dict:
-    """
-    num_predict caps the output token count per call.
-    Each pass gets a different budget:
-      - Fingerprint                    : 300  (4 small flat fields)
-      - Summary / entities / synthesis : 512  (short outputs)
-      - Clauses                        : 800  (5 clauses × ~160 tokens each)
-      - Risks                          : 900  (5 risks   × ~180 tokens each)
-    Without this cap phi4-mini enters a generation loop inside JSON arrays,
-    producing 15+ duplicate entries and wasting 60–70 seconds per chunk.
-    """
     client = AsyncClient(
         host=OLLAMA_HOST.rstrip("/"),
         timeout=OLLAMA_TIMEOUT_SECONDS,
