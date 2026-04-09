@@ -1,4 +1,11 @@
 streamlit>=1.32.0
-pdfplumber>=0.10.3
 python-dotenv>=1.0.1
 ollama>=0.4.0
+
+# OCR pipeline
+pdf2image>=1.17.0
+surya-ocr>=0.4.0
+opencv-python-headless>=4.9.0.80
+pillow>=10.0.0
+numpy>=1.26.0
+
